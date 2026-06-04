@@ -28,9 +28,10 @@ Contains generators for:
 Uses streaming_core.py for parsing Kiro stream into unified KiroEvent objects.
 """
 
+import asyncio
 import json
 import time
-from typing import TYPE_CHECKING, AsyncGenerator, Callable, Awaitable, Optional
+from typing import TYPE_CHECKING, AsyncGenerator, Callable, Awaitable, Optional, Any, Coroutine
 
 import httpx
 from fastapi import HTTPException
@@ -68,6 +69,10 @@ except ImportError:
 # Re-export FirstTokenTimeoutError for backward compatibility
 __all__ = ['FirstTokenTimeoutError', 'stream_kiro_to_openai', 'stream_with_first_token_retry', 'collect_stream_response']
 
+# Max nested web_search follow-up round-trips before falling back to dumping
+# raw results (prevents infinite loops if the model keeps calling web_search).
+MAX_FOLLOWUP_DEPTH = 3
+
 
 async def stream_kiro_to_openai_internal(
     client: httpx.AsyncClient,
@@ -78,7 +83,9 @@ async def stream_kiro_to_openai_internal(
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
     request_tools: Optional[list] = None,
-    conversation_id: Optional[str] = None
+    conversation_id: Optional[str] = None,
+    make_followup_request: Optional[Callable[..., Coroutine[Any, Any, httpx.Response]]] = None,
+    followup_depth: int = 0
 ) -> AsyncGenerator[str, None]:
     """
     Internal generator for converting Kiro stream to OpenAI format.
@@ -218,26 +225,131 @@ async def stream_kiro_to_openai_internal(
                     else:
                         logger.debug(f"WebSearch query (Path B): {query}")
                         
-                        # Call MCP API
-                        mcp_tool_use_id, results = await call_kiro_mcp_api(query, auth_manager)
+                        # Call MCP API with keep-alive chunks to prevent client timeout
+                        mcp_task = asyncio.create_task(call_kiro_mcp_api(query, auth_manager))
+                        while not mcp_task.done():
+                            try:
+                                await asyncio.wait_for(asyncio.shield(mcp_task), timeout=3.0)
+                            except asyncio.TimeoutError:
+                                # Send SSE comment as keep-alive to prevent client disconnect
+                                yield ": keepalive\n\n"
+                        mcp_tool_use_id, results = mcp_task.result()
                         
                         if results is None:
                             logger.error("MCP API call failed for web_search")
                             # Continue with normal tool_use processing (will show error to user)
                         else:
-                            # Emit summary as content chunks (OpenAI format)
                             summary = generate_search_summary(query, results)
-                            
-                            # Send content chunks
+
+                            # =====================================================
+                            # 2nd round-trip: feed the search results back to the
+                            # model so it can READ them and generate a real answer.
+                            # Previously we only dumped raw results + finish=stop,
+                            # so the model never got to respond and "continue after
+                            # web_search" appeared broken to the client.
+                            # =====================================================
+                            can_followup = (
+                                make_followup_request is not None
+                                and request_messages is not None
+                                and followup_depth < MAX_FOLLOWUP_DEPTH
+                            )
+
+                            if can_followup:
+                                # Narrow Optionals for the type checker; can_followup
+                                # already guarantees both are non-None.
+                                assert make_followup_request is not None
+                                assert request_messages is not None
+                                logger.info(
+                                    f"web_search follow-up: re-requesting model with "
+                                    f"search results (depth={followup_depth + 1})"
+                                )
+                                # One id shared by the assistant tool_call and the
+                                # tool result so the conversation links correctly.
+                                tool_call_id = (
+                                    tool.get("id")
+                                    or mcp_tool_use_id
+                                    or f"call_{generate_completion_id()}"
+                                )
+                                assistant_msg = {
+                                    "role": "assistant",
+                                    "content": full_content or None,
+                                    "tool_calls": [{
+                                        "id": tool_call_id,
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web_search",
+                                            "arguments": json.dumps(
+                                                {"query": query}, ensure_ascii=False
+                                            ),
+                                        },
+                                    }],
+                                }
+                                tool_msg = {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call_id,
+                                    "content": summary,
+                                }
+                                followup_messages = (
+                                    list(request_messages) + [assistant_msg, tool_msg]
+                                )
+
+                                # On the LAST allowed round, strip web_search so the
+                                # model is FORCED to answer with what it has instead
+                                # of looping on more searches (which would hit the
+                                # depth limit and dump raw <web_search> results).
+                                is_final_round = (followup_depth + 1) >= MAX_FOLLOWUP_DEPTH
+
+                                # Fire follow-up; keep-alive during prefill silence
+                                fu_task = asyncio.create_task(
+                                    make_followup_request(
+                                        followup_messages,
+                                        strip_web_search=is_final_round,
+                                    )
+                                )
+                                while not fu_task.done():
+                                    try:
+                                        await asyncio.wait_for(
+                                            asyncio.shield(fu_task), timeout=3.0
+                                        )
+                                    except asyncio.TimeoutError:
+                                        yield ": keepalive\n\n"
+                                fu_response = fu_task.result()
+
+                                # Recursively stream the model's real answer. The
+                                # recursive call owns the terminal chunks (final
+                                # usage + [DONE]); we return after so the outer
+                                # generator does NOT emit them twice.
+                                async for fu_chunk in stream_kiro_to_openai_internal(
+                                    client,
+                                    fu_response,
+                                    model,
+                                    model_cache,
+                                    auth_manager,
+                                    first_token_timeout=first_token_timeout,
+                                    request_messages=followup_messages,
+                                    request_tools=request_tools,
+                                    make_followup_request=make_followup_request,
+                                    followup_depth=followup_depth + 1,
+                                ):
+                                    yield fu_chunk
+                                return
+
+                            # Fallback (no follow-up plumbing or depth exceeded):
+                            # dump raw results as content (legacy behavior).
+                            if followup_depth >= MAX_FOLLOWUP_DEPTH:
+                                logger.warning(
+                                    f"web_search follow-up depth limit "
+                                    f"({MAX_FOLLOWUP_DEPTH}) reached, dumping raw results"
+                                )
                             chunk_size = 100
                             for i in range(0, len(summary), chunk_size):
                                 content_chunk = summary[i:i + chunk_size]
-                                
+
                                 delta = {"content": content_chunk}
                                 if first_chunk:
                                     delta["role"] = "assistant"
                                     first_chunk = False
-                                
+
                                 openai_chunk = {
                                     "id": completion_id,
                                     "object": "chat.completion.chunk",
@@ -245,17 +357,17 @@ async def stream_kiro_to_openai_internal(
                                     "model": model,
                                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
                                 }
-                                
+
                                 chunk_text = f"data: {json.dumps(openai_chunk, ensure_ascii=False)}\n\n"
-                                
+
                                 if debug_logger:
                                     debug_logger.log_modified_chunk(chunk_text.encode('utf-8'))
-                                
+
                                 yield chunk_text
-                            
+
                             # Accumulate for token counting
                             full_content += summary
-                            
+
                             # Skip normal tool_use processing
                             continue
                 
@@ -492,7 +604,8 @@ async def stream_with_first_token_retry(
     max_retries: int = FIRST_TOKEN_MAX_RETRIES,
     first_token_timeout: float = FIRST_TOKEN_TIMEOUT,
     request_messages: Optional[list] = None,
-    request_tools: Optional[list] = None
+    request_tools: Optional[list] = None,
+    make_followup_request: Optional[Callable[..., Coroutine[Any, Any, httpx.Response]]] = None
 ) -> AsyncGenerator[str, None]:
     """
     Streaming with automatic retry on first token timeout.
@@ -557,7 +670,8 @@ async def stream_with_first_token_retry(
             auth_manager,
             first_token_timeout=first_token_timeout,
             request_messages=request_messages,
-            request_tools=request_tools
+            request_tools=request_tools,
+            make_followup_request=make_followup_request
         ):
             yield chunk
     

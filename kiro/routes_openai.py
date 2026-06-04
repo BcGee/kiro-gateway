@@ -354,91 +354,119 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
             
             try:
-                # Make request to Kiro API
+                # Prepare token-counting data (needed by both stream paths)
+                messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+                tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+
+                if request_data.stream:
+                    # Streaming: do NOT pre-await the upstream request here.
+                    # Pre-awaiting blocks byte-silent for the entire prefill (TTFT)
+                    # window before StreamingResponse is returned, so large-context
+                    # follow-ups (e.g. after a tool call) look like a dead stream to
+                    # the client. Make the request INSIDE the generator where
+                    # keep-alive SSE comments flow during prefill
+                    # (see stream_with_first_token_retry in streaming_core.py).
+                    # NOTE: cross-account failover is not available for streaming in
+                    # this path; upstream errors surface inside the generator. This
+                    # is intentional (single-account deployments are unaffected).
+                    await account_manager.report_success(account.id, request_data.model)
+
+                    async def stream_wrapper():
+                        streaming_error = None
+                        client_disconnected = False
+                        try:
+                            async def make_retry_request():
+                                return await http_client.request_with_retry(
+                                    "POST", url, kiro_payload, stream=True
+                                )
+
+                            async for chunk in stream_with_first_token_retry(
+                                make_request=make_retry_request,
+                                client=http_client.client,
+                                model=request_data.model,
+                                model_cache=model_cache,
+                                auth_manager=auth_manager,
+                                initial_response=None,
+                                request_messages=messages_for_tokenizer,
+                                request_tools=tools_for_tokenizer
+                            ):
+                                yield chunk
+                        except GeneratorExit:
+                            client_disconnected = True
+                            logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
+                        except Exception as e:
+                            streaming_error = e
+                            # StreamingResponse already committed HTTP 200 (status +
+                            # headers sent, keepalive comments may have flowed during
+                            # prefill). Cannot raise an HTTP error now — that triggers
+                            # Starlette's "response already started". Emit the error
+                            # in-band as an SSE chunk + [DONE] and end cleanly.
+                            try:
+                                import time as _t
+                                err_chunk = {
+                                    "id": "error",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(_t.time()),
+                                    "model": request_data.model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": f"\n[kiro-gateway error] {e}"},
+                                        "finish_reason": "stop"
+                                    }]
+                                }
+                                yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+                                yield "data: [DONE]\n\n"
+                            except Exception:
+                                pass
+                            # Do NOT re-raise: response already started.
+                            return
+                        finally:
+                            await http_client.close()
+                            if streaming_error:
+                                error_type = type(streaming_error).__name__
+                                error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
+                                logger.error(f"HTTP 500 - POST /v1/chat/completions (streaming) - [{error_type}] {error_msg[:100]}")
+                            elif client_disconnected:
+                                logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
+                            else:
+                                logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - completed")
+                            if debug_logger:
+                                if streaming_error:
+                                    debug_logger.flush_on_error(500, str(streaming_error))
+                                else:
+                                    debug_logger.discard_buffers()
+
+                    return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
+
+                # Non-streaming: pre-await so we can classify errors and fail over.
                 response = await http_client.request_with_retry(
                     "POST",
                     url,
                     kiro_payload,
                     stream=True
                 )
-                
+
                 if response.status_code == 200:
                     # SUCCESS - report and return
                     await account_manager.report_success(account.id, request_data.model)
-                    
-                    # Prepare data for token counting
-                    messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
-                    tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
-                    
-                    if request_data.stream:
-                        # Streaming mode
-                        async def stream_wrapper():
-                            streaming_error = None
-                            client_disconnected = False
-                            try:
-                                async def make_retry_request():
-                                    return await http_client.request_with_retry(
-                                        "POST", url, kiro_payload, stream=True
-                                    )
-                                
-                                async for chunk in stream_with_first_token_retry(
-                                    make_request=make_retry_request,
-                                    client=http_client.client,
-                                    model=request_data.model,
-                                    model_cache=model_cache,
-                                    auth_manager=auth_manager,
-                                    initial_response=response,
-                                    request_messages=messages_for_tokenizer,
-                                    request_tools=tools_for_tokenizer
-                                ):
-                                    yield chunk
-                            except GeneratorExit:
-                                client_disconnected = True
-                                logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
-                            except Exception as e:
-                                streaming_error = e
-                                try:
-                                    yield "data: [DONE]\n\n"
-                                except Exception:
-                                    pass
-                                raise
-                            finally:
-                                await http_client.close()
-                                if streaming_error:
-                                    error_type = type(streaming_error).__name__
-                                    error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                                    logger.error(f"HTTP 500 - POST /v1/chat/completions (streaming) - [{error_type}] {error_msg[:100]}")
-                                elif client_disconnected:
-                                    logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
-                                else:
-                                    logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - completed")
-                                if debug_logger:
-                                    if streaming_error:
-                                        debug_logger.flush_on_error(500, str(streaming_error))
-                                    else:
-                                        debug_logger.discard_buffers()
-                        
-                        return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
-                    
-                    else:
-                        # Non-streaming mode
-                        openai_response = await collect_stream_response(
-                            http_client.client,
-                            response,
-                            request_data.model,
-                            model_cache,
-                            auth_manager,
-                            request_messages=messages_for_tokenizer,
-                            request_tools=tools_for_tokenizer
-                        )
-                        
-                        await http_client.close()
-                        logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
-                        
-                        if debug_logger:
-                            debug_logger.discard_buffers()
-                        
-                        return JSONResponse(content=openai_response)
+
+                    openai_response = await collect_stream_response(
+                        http_client.client,
+                        response,
+                        request_data.model,
+                        model_cache,
+                        auth_manager,
+                        request_messages=messages_for_tokenizer,
+                        request_tools=tools_for_tokenizer
+                    )
+
+                    await http_client.close()
+                    logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
+
+                    if debug_logger:
+                        debug_logger.discard_buffers()
+
+                    return JSONResponse(content=openai_response)
                 
                 else:
                     # ERROR - classify and decide
@@ -609,8 +637,125 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
         shared_client = request.app.state.http_client
         http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
     try:
-        # Make request to Kiro API (for both streaming and non-streaming modes)
-        # Important: we wait for Kiro response BEFORE returning StreamingResponse,
+        # Prepare data for fallback token counting (needed by both paths)
+        messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+        tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+
+        if request_data.stream:
+            # Streaming: do NOT pre-await the upstream request.
+            # Pre-awaiting blocks byte-silent for the entire prefill (TTFT) window
+            # before StreamingResponse is returned, so large-context follow-ups
+            # (e.g. after a tool call) look like a dead stream to the client.
+            # Make the request INSIDE the generator where keep-alive SSE comments
+            # flow during prefill (see stream_with_first_token_retry).
+            async def stream_wrapper():
+                streaming_error = None
+                client_disconnected = False
+                try:
+                    # Create retry request function (used for first attempt + retries)
+                    async def make_retry_request():
+                        return await http_client.request_with_retry(
+                            "POST", url, kiro_payload, stream=True
+                        )
+
+                    # web_search 2nd round-trip: rebuild payload with the original
+                    # messages + the model's tool_call + the search results, then
+                    # re-request so the model can read the results and answer.
+                    # strip_web_search=True (final round) removes the web_search tool
+                    # so the model MUST answer instead of looping on more searches.
+                    async def make_followup_request(followup_messages, strip_web_search=False):
+                        from kiro.models_openai import ChatMessage
+                        update = {
+                            "messages": [ChatMessage(**m) for m in followup_messages],
+                            "stream": True,
+                        }
+                        if strip_web_search and request_data.tools:
+                            kept_tools = [
+                                t for t in request_data.tools
+                                if ((t.function.name if t.function else None) or t.name)
+                                != "web_search"
+                            ]
+                            update["tools"] = kept_tools or None
+                            if not kept_tools:
+                                update["tool_choice"] = None
+                        fu_request = request_data.model_copy(update=update)
+                        fu_conversation_id = generate_conversation_id()
+                        fu_payload = build_kiro_payload(
+                            fu_request, fu_conversation_id, profile_arn_for_payload
+                        )
+                        return await http_client.request_with_retry(
+                            "POST", url, fu_payload, stream=True
+                        )
+
+                    # initial_response=None forces the request to happen inside the
+                    # retry wrapper, which sends keepalive chunks during prefill.
+                    async for chunk in stream_with_first_token_retry(
+                        make_request=make_retry_request,
+                        client=http_client.client,
+                        model=request_data.model,
+                        model_cache=model_cache,
+                        auth_manager=auth_manager,
+                        initial_response=None,
+                        request_messages=messages_for_tokenizer,
+                        request_tools=tools_for_tokenizer,
+                        make_followup_request=make_followup_request
+                    ):
+                        yield chunk
+                except GeneratorExit:
+                    # Client disconnected - this is normal
+                    client_disconnected = True
+                    logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
+                except Exception as e:
+                    streaming_error = e
+                    # The downstream StreamingResponse has already committed HTTP 200
+                    # (status + headers were sent the moment we started yielding, and
+                    # keepalive comments may have flowed during prefill). We therefore
+                    # CANNOT surface this as an HTTP error status anymore. Re-raising
+                    # here makes Starlette throw "response already started". Instead,
+                    # emit the error in-band as an OpenAI SSE chunk + [DONE] and end
+                    # the generator cleanly. The finally block still logs it as 500.
+                    try:
+                        import time as _t
+                        err_chunk = {
+                            "id": "error",
+                            "object": "chat.completion.chunk",
+                            "created": int(_t.time()),
+                            "model": request_data.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": f"\n[kiro-gateway error] {e}"},
+                                "finish_reason": "stop"
+                            }]
+                        }
+                        yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                    except Exception:
+                        pass  # Client already disconnected
+                    # Do NOT re-raise: response already started.
+                    return
+                finally:
+                    await http_client.close()
+                    # Log access log for streaming (success or error)
+                    if streaming_error:
+                        error_type = type(streaming_error).__name__
+                        error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
+                        logger.error(f"HTTP 500 - POST /v1/chat/completions (streaming) - [{error_type}] {error_msg[:100]}")
+                    elif client_disconnected:
+                        logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
+                    else:
+                        logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - completed")
+                    # Write debug logs AFTER streaming completes
+                    if debug_logger:
+                        if streaming_error:
+                            debug_logger.flush_on_error(500, str(streaming_error))
+                        else:
+                            debug_logger.discard_buffers()
+
+            return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
+
+        # Non-streaming: pre-await so we can classify upstream errors before
+        # committing to a response shape.
+        # Important: we wait for Kiro response BEFORE returning,
         # so that 200 OK means Kiro accepted the request and started responding
         response = await http_client.request_with_retry(
             "POST",
@@ -618,7 +763,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             kiro_payload,
             stream=True
         )
-        
+
         if response.status_code != 200:
             try:
                 error_content = await response.aread()
@@ -661,92 +806,28 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     }
                 }
             )
+
+        # Non-streaming mode - collect entire response
+        openai_response = await collect_stream_response(
+            http_client.client,
+            response,
+            request_data.model,
+            model_cache,
+            auth_manager,
+            request_messages=messages_for_tokenizer,
+            request_tools=tools_for_tokenizer
+        )
         
-        # Prepare data for fallback token counting
-        # Convert Pydantic models to dicts for tokenizer
-        messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
-        tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+        await http_client.close()
         
-        if request_data.stream:
-            # Streaming mode with first token retry
-            async def stream_wrapper():
-                streaming_error = None
-                client_disconnected = False
-                try:
-                    # Create retry request function for retries
-                    async def make_retry_request():
-                        return await http_client.request_with_retry(
-                            "POST", url, kiro_payload, stream=True
-                        )
-                    
-                    # Use retry wrapper with initial response
-                    async for chunk in stream_with_first_token_retry(
-                        make_request=make_retry_request,
-                        client=http_client.client,
-                        model=request_data.model,
-                        model_cache=model_cache,
-                        auth_manager=auth_manager,
-                        initial_response=response,
-                        request_messages=messages_for_tokenizer,
-                        request_tools=tools_for_tokenizer
-                    ):
-                        yield chunk
-                except GeneratorExit:
-                    # Client disconnected - this is normal
-                    client_disconnected = True
-                    logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
-                except Exception as e:
-                    streaming_error = e
-                    # Try to send [DONE] to client before finishing
-                    # so client doesn't "hang" waiting for data
-                    try:
-                        yield "data: [DONE]\n\n"
-                    except Exception:
-                        pass  # Client already disconnected
-                    raise
-                finally:
-                    await http_client.close()
-                    # Log access log for streaming (success or error)
-                    if streaming_error:
-                        error_type = type(streaming_error).__name__
-                        error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
-                        logger.error(f"HTTP 500 - POST /v1/chat/completions (streaming) - [{error_type}] {error_msg[:100]}")
-                    elif client_disconnected:
-                        logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
-                    else:
-                        logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - completed")
-                    # Write debug logs AFTER streaming completes
-                    if debug_logger:
-                        if streaming_error:
-                            debug_logger.flush_on_error(500, str(streaming_error))
-                        else:
-                            debug_logger.discard_buffers()
-            
-            return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
-        
-        else:
-            
-            # Non-streaming mode - collect entire response
-            openai_response = await collect_stream_response(
-                http_client.client,
-                response,
-                request_data.model,
-                model_cache,
-                auth_manager,
-                request_messages=messages_for_tokenizer,
-                request_tools=tools_for_tokenizer
-            )
-            
-            await http_client.close()
-            
-            # Log access log for non-streaming success
-            logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
-            
-            # Write debug logs after non-streaming request completes
-            if debug_logger:
-                debug_logger.discard_buffers()
-            
-            return JSONResponse(content=openai_response)
+        # Log access log for non-streaming success
+        logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
+
+        # Write debug logs after non-streaming request completes
+        if debug_logger:
+            debug_logger.discard_buffers()
+
+        return JSONResponse(content=openai_response)
     
     except HTTPException as e:
         await http_client.close()

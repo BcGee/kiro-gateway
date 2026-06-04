@@ -217,7 +217,9 @@ class KiroAuthManager:
         # Set up URLs with correct regions:
         # - OIDC refresh: uses SSO region (for token refresh)
         # - API/Q hosts: use determined API region (for Q Developer API calls)
-        sso_region_for_oidc = self._sso_region or region
+        # Allow KIRO_REGION env var to override SSO region for OIDC refresh too
+        kiro_region_env = os.getenv("KIRO_REGION")
+        sso_region_for_oidc = kiro_region_env or self._sso_region or region
         self._refresh_url = get_kiro_refresh_url(sso_region_for_oidc)
         self._api_host = get_kiro_api_host(final_api_region)
         self._q_host = get_kiro_q_host(final_api_region)
@@ -876,6 +878,9 @@ class KiroAuthManager:
         to SQLite), the refresh_token in SQLite becomes stale. In this case, we fall back
         to using the access_token directly until it actually expires.
         
+        For JSON file mode (Kiro IDE): reloads credentials from file before refresh,
+        since Kiro IDE may have already refreshed the token in the background.
+        
         Returns:
             Valid access token
         
@@ -886,6 +891,15 @@ class KiroAuthManager:
             # Token is valid and not expiring soon - just return it
             if self._access_token and not self.is_token_expiring_soon():
                 return self._access_token
+            
+            # JSON file mode: reload credentials from file first, Kiro IDE might have refreshed them
+            if self._creds_file and self.is_token_expiring_soon():
+                logger.debug("JSON file mode: reloading credentials before refresh attempt")
+                self._load_credentials_from_file(self._creds_file)
+                # Check if reloaded token is now valid
+                if self._access_token and not self.is_token_expiring_soon():
+                    logger.debug("JSON file reload provided fresh token, no refresh needed")
+                    return self._access_token
             
             # SQLite mode: reload credentials first, kiro-cli might have updated them
             if self._sqlite_db and self.is_token_expiring_soon():
@@ -900,29 +914,25 @@ class KiroAuthManager:
             try:
                 await self._refresh_token_request()
             except httpx.HTTPStatusError as e:
-                # Graceful degradation for SQLite mode when refresh fails twice
-                # This happens when kiro-cli refreshed tokens in memory without persisting
-                if e.response.status_code == 400 and self._sqlite_db:
+                # Graceful degradation when refresh fails
+                # This happens when token was issued in a different region or refresh_token is stale
+                if self._access_token and not self.is_token_expired():
                     logger.warning(
-                        "Token refresh failed with 400 after SQLite reload. "
-                        "This may happen if kiro-cli refreshed tokens in memory without persisting."
+                        f"Token refresh failed with {e.response.status_code}. "
+                        "Using existing access_token until it expires. "
+                        "Kiro IDE will refresh the token in the background."
                     )
-                    # Check if access_token is still usable
-                    if self._access_token and not self.is_token_expired():
-                        logger.warning(
-                            "Using existing access_token until it expires. "
-                            "Run 'kiro-cli login' when convenient to refresh credentials."
-                        )
-                        return self._access_token
-                    else:
-                        raise ValueError(
-                            "Token expired and refresh failed. "
-                            "Please run 'kiro-cli login' to refresh your credentials."
-                        )
+                    return self._access_token
                 # Non-SQLite mode or non-400 error - propagate the exception
                 raise
-            except Exception:
-                # For any other exception, propagate it
+            except Exception as e:
+                # For any other exception, try graceful degradation
+                if self._access_token and not self.is_token_expired():
+                    logger.warning(
+                        f"Token refresh failed: {e}. "
+                        "Using existing access_token until it expires."
+                    )
+                    return self._access_token
                 raise
             
             if not self._access_token:

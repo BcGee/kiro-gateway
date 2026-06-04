@@ -431,7 +431,27 @@ async def stream_with_first_token_retry(
                 response = initial_response
                 logger.debug("Reusing initial response for first attempt")
             else:
-                response = await make_request()
+                # Make request with keep-alive chunks during prefill (TTFT) to
+                # prevent client disconnect on large-context requests where the
+                # upstream withholds HTTP 200 headers until the first token is
+                # ready. Without this, the route stays byte-silent for the entire
+                # prefill window (observed 19s+ on ~470K-token follow-ups), and
+                # the client (e.g. Hermes) treats the silence as a dead stream.
+                async def _run_make_request() -> httpx.Response:
+                    return await make_request()
+
+                req_task = asyncio.create_task(_run_make_request())
+                _ka_count = 0
+                while not req_task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(req_task), timeout=3.0)
+                    except asyncio.TimeoutError:
+                        # SSE comment as keep-alive (ignored by OpenAI/Anthropic parsers)
+                        _ka_count += 1
+                        yield ": keepalive\n\n"
+                if _ka_count:
+                    logger.debug(f"Sent {_ka_count} keep-alive chunk(s) during prefill ({_ka_count * 3}s+ TTFT)")
+                response = req_task.result()
             
             if response.status_code != 200:
                 # Error from API - close response and raise exception
