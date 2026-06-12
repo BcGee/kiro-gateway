@@ -1044,6 +1044,12 @@ class TestCalculateTokensFromContextUsage:
 
 class TestThinkingParserIntegration:
     """Tests for thinking parser integration in streaming."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_native_reasoning(self, monkeypatch):
+        # These tests verify the LEGACY thinking-parser path. Native reasoning
+        # (default ON) skips ThinkingParser creation, so disable it here.
+        monkeypatch.setattr("kiro.streaming_core.NATIVE_REASONING_ENABLED", False)
     
     @pytest.mark.asyncio
     async def test_thinking_parser_enabled_when_fake_reasoning_on(self, mock_response, mock_parser):

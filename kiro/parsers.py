@@ -240,6 +240,8 @@ class AwsEventStreamParser:
     # Patterns for finding JSON events
     EVENT_PATTERNS = [
         ('{"content":', 'content'),
+        ('{"text":', 'reasoning'),            # reasoningContentEvent (native extended thinking)
+        ('{"signature":', 'reasoning_sig'),   # reasoningContentEvent signature (metadata, ignored)
         ('{"name":', 'tool_start'),
         ('{"input":', 'tool_input'),
         ('{"stop":', 'tool_stop'),
@@ -318,6 +320,12 @@ class AwsEventStreamParser:
         """
         if event_type == 'content':
             return self._process_content_event(data)
+        elif event_type == 'reasoning':
+            return self._process_reasoning_event(data)
+        elif event_type == 'reasoning_sig':
+            # Signature is cryptographic metadata for native thinking blocks.
+            # We don't surface it to clients; just swallow it.
+            return None
         elif event_type == 'tool_start':
             return self._process_tool_start_event(data)
         elif event_type == 'tool_input':
@@ -346,6 +354,23 @@ class AwsEventStreamParser:
         self.last_content = content
         
         return {"type": "content", "data": content}
+    
+    def _process_reasoning_event(self, data: dict) -> Optional[Dict[str, Any]]:
+        """
+        Processes a native reasoningContentEvent (extended thinking).
+
+        The Kiro backend emits the model's native reasoning as a separate
+        event channel (reasoningContentEvent) with incremental {"text": ...}
+        deltas, followed by a {"signature": ...} metadata event. This is the
+        real model thinking, distinct from kg's legacy fake-reasoning prompt
+        injection. We surface it as a dedicated 'reasoning' event so the
+        streaming layer can map it to reasoning_content (OpenAI) or a native
+        thinking block (Anthropic).
+        """
+        text = data.get('text', '')
+        if not text:
+            return None
+        return {"type": "reasoning", "data": text}
     
     def _process_tool_start_event(self, data: dict) -> Optional[Dict[str, Any]]:
         """Processes tool call start."""

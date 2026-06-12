@@ -940,6 +940,11 @@ class TestThinkingParserConfigIntegration:
 
 class TestInjectThinkingTags:
     """Tests for inject_thinking_tags function in converters."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_native_reasoning(self, monkeypatch):
+        # Legacy fake-injection path; native reasoning (default ON) gates it off.
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
     
     def test_injects_tags_when_enabled(self):
         """

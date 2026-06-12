@@ -479,6 +479,28 @@ FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(os.getenv("FAKE_REASONING_INITIAL_
 
 
 # ==================================================================================================
+# Native Reasoning Settings
+# ==================================================================================================
+#
+# As of 2026-06, the Kiro backend emits the model's NATIVE extended thinking as a
+# separate event channel (reasoningContentEvent) with {"text": ...} deltas plus a
+# {"signature": ...} metadata event. This is the real model reasoning — no prompt
+# injection required.
+#
+# When NATIVE_REASONING_ENABLED is true:
+#   - The stream parser captures reasoningContentEvent and surfaces it as
+#     reasoning_content (OpenAI) / native thinking blocks (Anthropic).
+#   - The legacy fake-reasoning prompt injection (<thinking_mode> tags) is
+#     SKIPPED, because it would only pollute the prompt and waste output tokens
+#     while the model already reasons natively.
+#
+# Set NATIVE_REASONING=false to fall back to the legacy fake-reasoning behavior
+# (prompt injection + <thinking> tag parsing). Default: true.
+_NATIVE_REASONING_RAW: str = os.getenv("NATIVE_REASONING", "").lower()
+NATIVE_REASONING_ENABLED: bool = _NATIVE_REASONING_RAW not in ("false", "0", "no", "disabled", "off")
+
+
+# ==================================================================================================
 # Payload Size Guard Settings
 # ==================================================================================================
 

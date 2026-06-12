@@ -41,6 +41,7 @@ from kiro.config import (
     FAKE_REASONING_ENABLED,
     FAKE_REASONING_MAX_TOKENS,
     FAKE_REASONING_BUDGET_CAP,
+    NATIVE_REASONING_ENABLED,
     KIRO_MAX_PAYLOAD_BYTES,
     AUTO_TRIM_PAYLOAD,
 )
@@ -386,6 +387,13 @@ def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
     """
     # Check if thinking is enabled globally
     if not FAKE_REASONING_ENABLED:
+        return content
+
+    # If native reasoning is active, the model already emits its own
+    # reasoningContentEvent stream. Injecting <thinking_mode> tags would only
+    # pollute the prompt and waste output tokens, so skip injection entirely.
+    if NATIVE_REASONING_ENABLED:
+        logger.debug("Native reasoning enabled - skipping fake-reasoning tag injection")
         return content
     
     # Check if thinking is enabled for this request

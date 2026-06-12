@@ -43,6 +43,7 @@ from kiro.config import (
     FIRST_TOKEN_MAX_RETRIES,
     FAKE_REASONING_ENABLED,
     FAKE_REASONING_HANDLING,
+    NATIVE_REASONING_ENABLED,
 )
 from kiro.thinking_parser import ThinkingParser
 
@@ -140,11 +141,17 @@ async def parse_kiro_stream(
     parser = AwsEventStreamParser()
     first_token_received = False
     
-    # Initialize thinking parser if fake reasoning is enabled
+    # Initialize thinking parser only for legacy fake-reasoning mode.
+    # When native reasoning is active, the model emits a dedicated
+    # reasoningContentEvent stream (no <thinking> tags in content), so the
+    # tag-detecting ThinkingParser is unnecessary and would only add buffering
+    # latency to the content channel.
     thinking_parser: Optional[ThinkingParser] = None
-    if FAKE_REASONING_ENABLED and enable_thinking_parser:
+    if FAKE_REASONING_ENABLED and enable_thinking_parser and not NATIVE_REASONING_ENABLED:
         thinking_parser = ThinkingParser(handling_mode=FAKE_REASONING_HANDLING)
         logger.debug(f"Thinking parser initialized with mode: {FAKE_REASONING_HANDLING}")
+    elif NATIVE_REASONING_ENABLED:
+        logger.debug("Native reasoning enabled - thinking parser skipped (using reasoningContentEvent)")
     
     try:
         # Create iterator for reading bytes
@@ -296,6 +303,12 @@ async def _process_chunk(
             else:
                 # No thinking parser - pass through as-is
                 yield KiroEvent(type="content", content=content)
+        
+        elif event["type"] == "reasoning":
+            # Native extended thinking from the model (reasoningContentEvent).
+            # This is NOT wrapped in tags, so it bypasses the ThinkingParser
+            # entirely and is emitted directly as a thinking event.
+            yield KiroEvent(type="thinking", thinking_content=event["data"])
         
         elif event["type"] == "usage":
             yield KiroEvent(type="usage", usage=event["data"])

@@ -3512,6 +3512,13 @@ class TestInjectThinkingTags:
     
     This function injects thinking mode tags into content when FAKE_REASONING_ENABLED is True.
     """
+
+    @pytest.fixture(autouse=True)
+    def _disable_native_reasoning(self, monkeypatch):
+        # These tests verify the LEGACY fake-injection path. Native reasoning
+        # (default ON) gates injection off, so disable it here to exercise the
+        # legacy behavior.
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
     
     def test_returns_original_content_when_disabled(self):
         """
@@ -6277,6 +6284,12 @@ class TestThinkingConfig:
 
 class TestInjectThinkingTagsWithConfig:
     """Tests for inject_thinking_tags with ThinkingConfig parameter."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_native_reasoning(self, monkeypatch):
+        # Legacy fake-injection path tests; native reasoning (default ON) gates
+        # injection off, so disable it here.
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
     
     def test_disabled_by_global_flag(self, monkeypatch):
         """
@@ -6424,6 +6437,11 @@ class TestInjectThinkingTagsWithConfig:
 
 class TestBuildKiroPayloadWithThinkingConfig:
     """Tests for build_kiro_payload with thinking_config parameter."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_native_reasoning(self, monkeypatch):
+        # Legacy fake-injection path; native reasoning (default ON) gates it off.
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
     
     def test_passes_thinking_config_to_inject(self, monkeypatch):
         """
