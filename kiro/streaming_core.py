@@ -165,6 +165,16 @@ async def parse_kiro_stream(
             # Empty response - this is normal, just finish
             logger.debug("Empty response from Kiro API")
             return
+        except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+            # Upstream dropped the connection before sending any token. Nothing has
+            # been emitted to the client yet, so it is safe to retry. Reuse the
+            # first-token retry path by raising FirstTokenTimeoutError.
+            logger.warning(
+                "Upstream closed connection before first token [{}: {}] - triggering retry",
+                type(e).__name__,
+                str(e) if str(e) else "(empty message)",
+            )
+            raise FirstTokenTimeoutError("Upstream closed connection before first token")
         
         # Process first chunk
         if debug_logger:
@@ -176,12 +186,24 @@ async def parse_kiro_stream(
             yield event
         
         # Continue reading remaining chunks
-        async for chunk in byte_iterator:
-            if debug_logger:
-                debug_logger.log_raw_chunk(chunk)
-            
-            async for event in _process_chunk(parser, chunk, thinking_parser):
-                yield event
+        try:
+            async for chunk in byte_iterator:
+                if debug_logger:
+                    debug_logger.log_raw_chunk(chunk)
+                
+                async for event in _process_chunk(parser, chunk, thinking_parser):
+                    yield event
+        except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+            # Upstream Kiro closed the connection before completing the chunked
+            # body (incomplete chunked read). Content was already streamed, so we
+            # cannot retry without duplicating output to the client. End the stream
+            # gracefully and fall through to the finalization below so the client
+            # keeps the partial content + a proper finish marker instead of HTTP 500.
+            logger.warning(
+                "Upstream connection dropped mid-stream [{}: {}] - finalizing with partial content",
+                type(e).__name__,
+                str(e) if str(e) else "(empty message)",
+            )
         
         # Finalize thinking parser and yield any remaining content
         if thinking_parser:
