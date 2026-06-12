@@ -81,7 +81,71 @@ thinking, costs no prompt-budget hack, and is faster to first token. The fake
 path remains available as a fallback for any model that does *not* emit
 `reasoningContentEvent`.
 
+## Native effort control (decoded from the Kiro client + verified live)
+
+The Kiro "Max"/effort selector is **NOT prompt injection** — it sends a
+top-level Bedrock Converse `additionalModelRequestFields` object. Decoded from
+the client bundle (`extension.js`, function `Er`):
+
+```js
+function Er(level, schema) {
+  switch (schema) {
+    case "output_config":
+      return { thinking: { type: "adaptive", display: "summarized" },
+               output_config: { effort: level } };
+    case "reasoning":
+      return { reasoning: { effort: level } };
+  }
+}
+```
+
+Verified live against `runtime.kiro.dev/generateAssistantResponse`:
+- Location: **top-level** `additionalModelRequestFields` (sibling of
+  `conversationState`/`profileArn`). Placing it on `userInputMessage` or
+  `conversationState` is silently ignored; placing the wrong schema returns a
+  400 that names the expected enum.
+- Effort value is **lowercase**: `low|medium|high|xhigh|max` (the client's
+  `Yh2()` PascalCase is display-only; the backend enum is lowercase).
+- Effort actually scales reasoning: e.g. opus-4.8 baseline ≈131 reasoning chars
+  vs `max` ≈316–449 chars (probe_effort_field.py).
+
+### Per-model effort schema (empirically probed — probe_all_schemas.py)
+
+`runtime.kiro.dev` does not expose `ListAvailableModels`, so the schema cannot
+be read dynamically. Probing every model with a deliberately-invalid effort and
+reading the 400 message gives:
+
+| schema | models |
+|---|---|
+| `output_config` | auto, claude-opus-4.6, claude-opus-4.7, claude-opus-4.8, claude-sonnet-4.6 |
+| unsupported (400 "not supported for this model") | claude-sonnet-4, claude-sonnet-4.5, claude-haiku-4.5, claude-opus-4.5, deepseek-3.2, glm-5, minimax-m2.1, minimax-m2.5, qwen3-coder-next |
+
+Only the 4.6+ Anthropic models accept native effort; older/non-Anthropic models
+reject `additionalModelRequestFields` outright.
+
+### What changed for effort
+
+- `config.py` — `NATIVE_EFFORT_SCHEMA_BY_MODEL` (empirical map),
+  `VALID_EFFORT_LEVELS`, `EFFORT_LEVEL_ALIASES` (minimal→low).
+- `converters_core.py` — `build_native_effort_fields()` builds the correct
+  `additionalModelRequestFields` per model/schema; payload assembly emits it at
+  top level when native reasoning is on, the request asked for effort, and the
+  model supports it. `ThinkingConfig` gained `effort_level`.
+- `converters_openai.py` — `reasoning_effort` (incl. new `max`) flows into
+  `effort_level`; `reasoning_effort_to_budget` gained `max`.
+- `converters_anthropic.py` — Anthropic `thinking.budget_tokens` is bucketed
+  into an effort level (`_budget_to_effort_level`).
+- `models_openai.py` — `reasoning_effort` literal now accepts `max`.
+- `get_thinking_system_prompt_addition()` is also gated off under native
+  reasoning (it previously polluted the system prompt with `<thinking_mode>`
+  documentation on every request — the second injection path).
+
 ## Repro scripts (kept in repo root, not packaged)
 - `probe_decode.py` — decode raw event-stream, show native reasoning vs answer.
 - `probe_native_reasoning.py` — probe whether native control fields are honored.
 - `probe_ab_compare.py` — 3-way live comparison (needs instances on 9100/9200/9300).
+- `probe_effort_field.py` — locate where effort goes + confirm it scales reasoning.
+- `probe_all_schemas.py` — empirically map each model's effort schema.
+- `probe_payload_proof.py` — deterministic: show built payload has correct
+  additionalModelRequestFields and no `<thinking_mode>` leakage.
+- `probe_e2e_effort.py` — end-to-end through the OpenAI endpoint.

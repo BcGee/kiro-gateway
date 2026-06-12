@@ -420,10 +420,33 @@ def extract_thinking_config_from_anthropic(request: AnthropicMessagesRequest) ->
         budget = request.thinking.get("budget_tokens")
         if budget:
             logger.debug(f"Extracted thinking config from Anthropic: type='enabled', budget={budget}")
-        return ThinkingConfig(enabled=True, budget_tokens=budget)
+        # Map the Anthropic budget to a native effort level. Anthropic has no
+        # discrete effort enum, so we bucket budget_tokens into the backend's
+        # low/medium/high/xhigh/max levels for additionalModelRequestFields.
+        effort = _budget_to_effort_level(budget) if budget else None
+        return ThinkingConfig(enabled=True, budget_tokens=budget, effort_level=effort)
     
     # Unknown type → use defaults
     return ThinkingConfig(enabled=True, budget_tokens=None)
+
+
+def _budget_to_effort_level(budget_tokens: int) -> str:
+    """
+    Bucket an Anthropic thinking budget into the backend effort enum.
+
+    Anthropic clients express reasoning depth as a token budget, while the Kiro
+    backend's native effort field expects a discrete level. These thresholds are
+    a pragmatic mapping (not from an official spec).
+    """
+    if budget_tokens <= 2048:
+        return "low"
+    if budget_tokens <= 8192:
+        return "medium"
+    if budget_tokens <= 24576:
+        return "high"
+    if budget_tokens <= 49152:
+        return "xhigh"
+    return "max"
 
 
 def anthropic_to_kiro(

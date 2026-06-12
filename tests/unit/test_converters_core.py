@@ -5922,16 +5922,17 @@ class TestBuildKiroPayloadImages:
         
         print("Action: Building Kiro payload with thinking injection...")
         with patch('kiro.converters_core.FAKE_REASONING_ENABLED', True):
-            with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
-                result = build_kiro_payload(
-                    messages=messages,
-                    system_prompt="",
-                    model_id="claude-sonnet-4",
-                    tools=None,
-                    conversation_id="test-conv",
-                    profile_arn="arn:test",
-                    thinking_config=ThinkingConfig(enabled=True)
-                )
+            with patch('kiro.converters_core.NATIVE_REASONING_ENABLED', False):
+                with patch('kiro.converters_core.FAKE_REASONING_MAX_TOKENS', 4000):
+                    result = build_kiro_payload(
+                        messages=messages,
+                        system_prompt="",
+                        model_id="claude-sonnet-4",
+                        tools=None,
+                        conversation_id="test-conv",
+                        profile_arn="arn:test",
+                        thinking_config=ThinkingConfig(enabled=True)
+                    )
         
         current_msg = result.payload["conversationState"]["currentMessage"]["userInputMessage"]
         
