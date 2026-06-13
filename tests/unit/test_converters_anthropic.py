@@ -1444,6 +1444,11 @@ class TestConvertAnthropicTools:
 class TestAnthropicToKiro:
     """Tests for anthropic_to_kiro function - main entry point."""
 
+    @pytest.fixture(autouse=True)
+    def _disable_native_reasoning(self, monkeypatch):
+        # Legacy fake-injection path; native reasoning (default ON) gates it off.
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
+
     def test_builds_simple_payload(self):
         """
         What it does: Verifies building of simple Kiro payload.
@@ -1857,6 +1862,11 @@ class TestExtractThinkingConfigFromAnthropic:
 
 class TestAnthropicToKiroIntegration:
     """Integration tests for anthropic_to_kiro with thinking config."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_native_reasoning(self, monkeypatch):
+        # Legacy fake-injection path; native reasoning (default ON) gates it off.
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
     
     def test_extracts_and_passes_thinking_config(self):
         """

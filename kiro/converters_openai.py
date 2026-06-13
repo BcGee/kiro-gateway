@@ -323,7 +323,8 @@ def reasoning_effort_to_budget(max_tokens: int, effort: str) -> int:
         "low": 0.20,      # 20% - quick reasoning
         "medium": 0.50,   # 50% - balanced reasoning
         "high": 0.80,     # 80% - deep reasoning
-        "xhigh": 0.95,    # 95% - maximum reasoning depth
+        "xhigh": 0.95,    # 95% - very deep reasoning
+        "max": 1.0,       # 100% - maximum reasoning depth
     }
     return int(max_tokens * percent[effort])
 
@@ -383,7 +384,13 @@ def extract_thinking_config_from_openai(request: ChatCompletionRequest) -> Think
         f"max_tokens={max_tokens}, budget={budget}"
     )
     
-    return ThinkingConfig(enabled=True, budget_tokens=budget)
+    # effort_level carries the raw value for native effort (additionalModelRequestFields);
+    # budget_tokens is retained for the legacy fake-reasoning path.
+    return ThinkingConfig(
+        enabled=True,
+        budget_tokens=budget,
+        effort_level=request.reasoning_effort,
+    )
 
 
 # ==================================================================================================

@@ -669,6 +669,11 @@ class TestConvertOpenAIToolsToUnified:
 
 class TestBuildKiroPayload:
     """Tests for build_kiro_payload function."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_native_reasoning(self, monkeypatch):
+        # Legacy fake-injection path; native reasoning (default ON) gates it off.
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
     
     def test_builds_simple_payload(self):
         """
@@ -1839,6 +1844,11 @@ class TestExtractThinkingConfigFromOpenAI:
 
 class TestBuildKiroPayloadIntegration:
     """Integration tests for build_kiro_payload with thinking config."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_native_reasoning(self, monkeypatch):
+        # Legacy fake-injection path; native reasoning (default ON) gates it off.
+        monkeypatch.setattr("kiro.converters_core.NATIVE_REASONING_ENABLED", False)
     
     def test_extracts_and_passes_thinking_config(self, monkeypatch):
         """

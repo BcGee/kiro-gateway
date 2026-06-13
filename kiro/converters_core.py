@@ -41,6 +41,11 @@ from kiro.config import (
     FAKE_REASONING_ENABLED,
     FAKE_REASONING_MAX_TOKENS,
     FAKE_REASONING_BUDGET_CAP,
+    NATIVE_REASONING_ENABLED,
+    NATIVE_EFFORT_SCHEMA_BY_MODEL,
+    VALID_EFFORT_LEVELS,
+    EFFORT_LEVEL_ALIASES,
+    DEFAULT_EFFORT_LEVEL,
     KIRO_MAX_PAYLOAD_BYTES,
     AUTO_TRIM_PAYLOAD,
 )
@@ -78,6 +83,7 @@ class ThinkingConfig:
     """
     enabled: bool = True
     budget_tokens: Optional[int] = None
+    effort_level: Optional[str] = None  # raw reasoning_effort (low/medium/high/xhigh/max) for native effort
 
 
 @dataclass
@@ -311,9 +317,16 @@ def get_thinking_system_prompt_addition() -> str:
     not prompt injection attempts.
     
     Returns:
-        System prompt addition text (empty string if fake reasoning is disabled)
+        System prompt addition text (empty string if fake reasoning is disabled
+        or native reasoning is active)
     """
     if not FAKE_REASONING_ENABLED:
+        return ""
+
+    # When native reasoning is active we never inject <thinking_mode> tags into
+    # user messages, so the system prompt must NOT advertise them either —
+    # otherwise it pollutes every request with stale instructions.
+    if NATIVE_REASONING_ENABLED:
         return ""
     
     return (
@@ -387,6 +400,13 @@ def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
     # Check if thinking is enabled globally
     if not FAKE_REASONING_ENABLED:
         return content
+
+    # If native reasoning is active, the model already emits its own
+    # reasoningContentEvent stream. Injecting <thinking_mode> tags would only
+    # pollute the prompt and waste output tokens, so skip injection entirely.
+    if NATIVE_REASONING_ENABLED:
+        logger.debug("Native reasoning enabled - skipping fake-reasoning tag injection")
+        return content
     
     # Check if thinking is enabled for this request
     if not thinking_config.enabled:
@@ -430,6 +450,59 @@ def inject_thinking_tags(content: str, thinking_config: ThinkingConfig) -> str:
     logger.debug(f"Injecting thinking tags with budget={effective_budget}")
     
     return thinking_prefix + content
+
+
+def build_native_effort_fields(
+    model_id: str,
+    effort_level: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Build the Bedrock Converse `additionalModelRequestFields` object that carries
+    native reasoning effort to the Kiro backend.
+
+    Decoded from the Kiro client and verified live against runtime.kiro.dev:
+      - Only certain models accept it (see NATIVE_EFFORT_SCHEMA_BY_MODEL); others
+        return 400 "additionalModelRequestFields is not supported for this model".
+      - The "output_config" schema shape is:
+            {"thinking": {"type": "adaptive", "display": "summarized"},
+             "output_config": {"effort": "<level>"}}
+      - The effort value must be lowercase and one of VALID_EFFORT_LEVELS.
+
+    Args:
+        model_id: Resolved Kiro model ID (dot form, e.g. "claude-opus-4.8")
+        effort_level: Client-supplied reasoning_effort (low/medium/high/xhigh/max,
+                      or aliases like "minimal"). None disables native effort.
+
+    Returns:
+        The additionalModelRequestFields dict, or None if not applicable
+        (no effort requested, model unsupported, or invalid level).
+    """
+    if not effort_level:
+        return None
+
+    schema = NATIVE_EFFORT_SCHEMA_BY_MODEL.get(model_id)
+    if not schema:
+        logger.debug(f"Model '{model_id}' does not support native effort; skipping")
+        return None
+
+    level = EFFORT_LEVEL_ALIASES.get(effort_level.lower())
+    if level not in VALID_EFFORT_LEVELS:
+        logger.warning(f"Invalid effort level '{effort_level}' for native effort; skipping")
+        return None
+
+    if schema == "output_config":
+        fields = {
+            "thinking": {"type": "adaptive", "display": "summarized"},
+            "output_config": {"effort": level},
+        }
+    elif schema == "reasoning":
+        fields = {"reasoning": {"effort": level}}
+    else:
+        logger.warning(f"Unknown effort schema '{schema}' for model '{model_id}'; skipping")
+        return None
+
+    logger.debug(f"Native effort for '{model_id}': schema={schema}, effort={level}")
+    return fields
 
 
 # ==================================================================================================
@@ -1583,6 +1656,18 @@ def build_kiro_payload(
     # Add profileArn
     if profile_arn:
         payload["profileArn"] = profile_arn
+
+    # Add native reasoning effort via top-level additionalModelRequestFields.
+    # Verified live: this is how the Kiro client carries effort/Max to the backend
+    # (NOT prompt injection). The effort level is the client-supplied value, or
+    # DEFAULT_EFFORT_LEVEL when the client didn't specify one. Only emitted when
+    # native reasoning is enabled, thinking is on, and the model supports effort.
+    if NATIVE_REASONING_ENABLED and thinking_config.enabled:
+        effort_level = thinking_config.effort_level or DEFAULT_EFFORT_LEVEL
+        if effort_level:
+            effort_fields = build_native_effort_fields(model_id, effort_level)
+            if effort_fields:
+                payload["additionalModelRequestFields"] = effort_fields
 
     # Payload size guard — auto-trim if enabled
     if AUTO_TRIM_PAYLOAD:

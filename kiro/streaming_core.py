@@ -43,6 +43,7 @@ from kiro.config import (
     FIRST_TOKEN_MAX_RETRIES,
     FAKE_REASONING_ENABLED,
     FAKE_REASONING_HANDLING,
+    NATIVE_REASONING_ENABLED,
 )
 from kiro.thinking_parser import ThinkingParser
 
@@ -140,11 +141,17 @@ async def parse_kiro_stream(
     parser = AwsEventStreamParser()
     first_token_received = False
     
-    # Initialize thinking parser if fake reasoning is enabled
+    # Initialize thinking parser only for legacy fake-reasoning mode.
+    # When native reasoning is active, the model emits a dedicated
+    # reasoningContentEvent stream (no <thinking> tags in content), so the
+    # tag-detecting ThinkingParser is unnecessary and would only add buffering
+    # latency to the content channel.
     thinking_parser: Optional[ThinkingParser] = None
-    if FAKE_REASONING_ENABLED and enable_thinking_parser:
+    if FAKE_REASONING_ENABLED and enable_thinking_parser and not NATIVE_REASONING_ENABLED:
         thinking_parser = ThinkingParser(handling_mode=FAKE_REASONING_HANDLING)
         logger.debug(f"Thinking parser initialized with mode: {FAKE_REASONING_HANDLING}")
+    elif NATIVE_REASONING_ENABLED:
+        logger.debug("Native reasoning enabled - thinking parser skipped (using reasoningContentEvent)")
     
     try:
         # Create iterator for reading bytes
@@ -165,6 +172,16 @@ async def parse_kiro_stream(
             # Empty response - this is normal, just finish
             logger.debug("Empty response from Kiro API")
             return
+        except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+            # Upstream dropped the connection before sending any token. Nothing has
+            # been emitted to the client yet, so it is safe to retry. Reuse the
+            # first-token retry path by raising FirstTokenTimeoutError.
+            logger.warning(
+                "Upstream closed connection before first token [{}: {}] - triggering retry",
+                type(e).__name__,
+                str(e) if str(e) else "(empty message)",
+            )
+            raise FirstTokenTimeoutError("Upstream closed connection before first token")
         
         # Process first chunk
         if debug_logger:
@@ -176,12 +193,24 @@ async def parse_kiro_stream(
             yield event
         
         # Continue reading remaining chunks
-        async for chunk in byte_iterator:
-            if debug_logger:
-                debug_logger.log_raw_chunk(chunk)
-            
-            async for event in _process_chunk(parser, chunk, thinking_parser):
-                yield event
+        try:
+            async for chunk in byte_iterator:
+                if debug_logger:
+                    debug_logger.log_raw_chunk(chunk)
+                
+                async for event in _process_chunk(parser, chunk, thinking_parser):
+                    yield event
+        except (httpx.RemoteProtocolError, httpx.ReadError) as e:
+            # Upstream Kiro closed the connection before completing the chunked
+            # body (incomplete chunked read). Content was already streamed, so we
+            # cannot retry without duplicating output to the client. End the stream
+            # gracefully and fall through to the finalization below so the client
+            # keeps the partial content + a proper finish marker instead of HTTP 500.
+            logger.warning(
+                "Upstream connection dropped mid-stream [{}: {}] - finalizing with partial content",
+                type(e).__name__,
+                str(e) if str(e) else "(empty message)",
+            )
         
         # Finalize thinking parser and yield any remaining content
         if thinking_parser:
@@ -274,6 +303,12 @@ async def _process_chunk(
             else:
                 # No thinking parser - pass through as-is
                 yield KiroEvent(type="content", content=content)
+        
+        elif event["type"] == "reasoning":
+            # Native extended thinking from the model (reasoningContentEvent).
+            # This is NOT wrapped in tags, so it bypasses the ThinkingParser
+            # entirely and is emitted directly as a thinking event.
+            yield KiroEvent(type="thinking", thinking_content=event["data"])
         
         elif event["type"] == "usage":
             yield KiroEvent(type="usage", usage=event["data"])

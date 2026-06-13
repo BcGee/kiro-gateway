@@ -446,6 +446,73 @@ class TestAwsEventStreamParserFeed:
         assert events[0]["data"] == "First"
         assert events[1]["data"] == "Second"
     
+    def test_parses_reasoning_event(self, aws_event_parser):
+        """
+        What it does: Tests parsing of a native reasoningContentEvent delta.
+        Goal: Ensure native extended-thinking text is surfaced as a 'reasoning' event.
+        """
+        print("Setup: Chunk with reasoningContentEvent text delta...")
+        chunk = b'{"text":"Let me think about this"}'
+        
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+        
+        print(f"Result: {events}")
+        assert len(events) == 1
+        assert events[0]["type"] == "reasoning"
+        assert events[0]["data"] == "Let me think about this"
+    
+    def test_parses_interleaved_reasoning_and_content(self, aws_event_parser):
+        """
+        What it does: Tests a stream that emits native reasoning then the answer.
+        Goal: Ensure reasoning and content events are kept on distinct channels
+              in order, mirroring the real backend (reasoningContentEvent first,
+              assistantResponseEvent after).
+        """
+        print("Setup: reasoning delta(s) followed by content...")
+        chunk = b'{"text":"17 x 23"}{"text":" = 391"}{"content":"The answer is 391."}'
+        
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+        
+        print(f"Result: {events}")
+        assert len(events) == 3
+        assert events[0]["type"] == "reasoning"
+        assert events[0]["data"] == "17 x 23"
+        assert events[1]["type"] == "reasoning"
+        assert events[1]["data"] == " = 391"
+        assert events[2]["type"] == "content"
+        assert events[2]["data"] == "The answer is 391."
+    
+    def test_reasoning_signature_event_is_swallowed(self, aws_event_parser):
+        """
+        What it does: Tests that the reasoningContentEvent signature metadata
+                      event produces no client-facing event.
+        Goal: Ensure the cryptographic signature is not leaked into output.
+        """
+        print("Setup: Chunk with reasoning signature metadata...")
+        chunk = b'{"signature":"EvEBCmMIDhABGAIqQJHc"}'
+        
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+        
+        print(f"Result: {events}")
+        assert events == []
+    
+    def test_empty_reasoning_text_produces_no_event(self, aws_event_parser):
+        """
+        What it does: Tests that an empty reasoning text delta is dropped.
+        Goal: Avoid emitting empty thinking deltas.
+        """
+        print("Setup: Chunk with empty reasoning text...")
+        chunk = b'{"text":""}'
+        
+        print("Action: Parsing chunk...")
+        events = aws_event_parser.feed(chunk)
+        
+        print(f"Result: {events}")
+        assert events == []
+    
     def test_deduplicates_repeated_content(self, aws_event_parser):
         """
         What it does: Tests deduplication of repeated content.

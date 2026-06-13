@@ -479,6 +479,77 @@ FAKE_REASONING_INITIAL_BUFFER_SIZE: int = int(os.getenv("FAKE_REASONING_INITIAL_
 
 
 # ==================================================================================================
+# Native Reasoning Settings
+# ==================================================================================================
+#
+# As of 2026-06, the Kiro backend emits the model's NATIVE extended thinking as a
+# separate event channel (reasoningContentEvent) with {"text": ...} deltas plus a
+# {"signature": ...} metadata event. This is the real model reasoning — no prompt
+# injection required.
+#
+# When NATIVE_REASONING_ENABLED is true:
+#   - The stream parser captures reasoningContentEvent and surfaces it as
+#     reasoning_content (OpenAI) / native thinking blocks (Anthropic).
+#   - The legacy fake-reasoning prompt injection (<thinking_mode> tags) is
+#     SKIPPED, because it would only pollute the prompt and waste output tokens
+#     while the model already reasons natively.
+#
+# Set NATIVE_REASONING=false to fall back to the legacy fake-reasoning behavior
+# (prompt injection + <thinking> tag parsing). Default: true.
+_NATIVE_REASONING_RAW: str = os.getenv("NATIVE_REASONING", "").lower()
+NATIVE_REASONING_ENABLED: bool = _NATIVE_REASONING_RAW not in ("false", "0", "no", "disabled", "off")
+
+# Native effort control via Bedrock Converse `additionalModelRequestFields`.
+#
+# Decoded from the Kiro client (extension.js) and verified live against
+# runtime.kiro.dev: the effort/Max selector is NOT prompt injection. The client
+# sends a top-level `additionalModelRequestFields` object whose shape depends on
+# the model's schema. For the models below, the schema is "output_config":
+#
+#   {"thinking": {"type": "adaptive", "display": "summarized"},
+#    "output_config": {"effort": "<low|medium|high|xhigh|max>"}}
+#
+# The effort value MUST be lowercase (backend enum: low/medium/high/xhigh/max).
+#
+# runtime.kiro.dev does not expose ListAvailableModels, so we cannot read the
+# per-model schema dynamically. This map was determined empirically by probing
+# every model (probe_all_schemas.py): models accept "output_config" or reject
+# additionalModelRequestFields entirely ("not supported for this model").
+NATIVE_EFFORT_SCHEMA_BY_MODEL: dict = {
+    "auto": "output_config",
+    "claude-opus-4.6": "output_config",
+    "claude-opus-4.7": "output_config",
+    "claude-opus-4.8": "output_config",
+    "claude-sonnet-4.6": "output_config",
+}
+
+# Valid effort enum accepted by the backend (lowercase).
+VALID_EFFORT_LEVELS: list = ["low", "medium", "high", "xhigh", "max"]
+
+# Map OpenAI/Anthropic reasoning_effort values to the backend effort enum.
+# OpenAI's "minimal" has no backend equivalent and maps to "low".
+EFFORT_LEVEL_ALIASES: dict = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "xhigh",
+    "max": "max",
+}
+
+# Default effort level applied when the client does NOT specify reasoning_effort.
+# Empty/unset = no default (model decides). Set e.g. DEFAULT_EFFORT_LEVEL=max to
+# force maximum native reasoning on every request for models that support it.
+# Only applies when NATIVE_REASONING is enabled and the model supports effort.
+_DEFAULT_EFFORT_RAW: str = os.getenv("DEFAULT_EFFORT_LEVEL", "").lower().strip()
+DEFAULT_EFFORT_LEVEL: Optional[str] = (
+    EFFORT_LEVEL_ALIASES.get(_DEFAULT_EFFORT_RAW)
+    if _DEFAULT_EFFORT_RAW in EFFORT_LEVEL_ALIASES
+    else None
+)
+
+
+# ==================================================================================================
 # Payload Size Guard Settings
 # ==================================================================================================
 
