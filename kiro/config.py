@@ -537,6 +537,17 @@ EFFORT_LEVEL_ALIASES: dict = {
     "max": "max",
 }
 
+# Default effort level applied when the client does NOT specify reasoning_effort.
+# Empty/unset = no default (model decides). Set e.g. DEFAULT_EFFORT_LEVEL=max to
+# force maximum native reasoning on every request for models that support it.
+# Only applies when NATIVE_REASONING is enabled and the model supports effort.
+_DEFAULT_EFFORT_RAW: str = os.getenv("DEFAULT_EFFORT_LEVEL", "").lower().strip()
+DEFAULT_EFFORT_LEVEL: Optional[str] = (
+    EFFORT_LEVEL_ALIASES.get(_DEFAULT_EFFORT_RAW)
+    if _DEFAULT_EFFORT_RAW in EFFORT_LEVEL_ALIASES
+    else None
+)
+
 
 # ==================================================================================================
 # Payload Size Guard Settings

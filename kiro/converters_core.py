@@ -45,6 +45,7 @@ from kiro.config import (
     NATIVE_EFFORT_SCHEMA_BY_MODEL,
     VALID_EFFORT_LEVELS,
     EFFORT_LEVEL_ALIASES,
+    DEFAULT_EFFORT_LEVEL,
     KIRO_MAX_PAYLOAD_BYTES,
     AUTO_TRIM_PAYLOAD,
 )
@@ -1658,12 +1659,15 @@ def build_kiro_payload(
 
     # Add native reasoning effort via top-level additionalModelRequestFields.
     # Verified live: this is how the Kiro client carries effort/Max to the backend
-    # (NOT prompt injection). Only emitted when native reasoning is enabled, the
-    # client requested an effort level, and the model supports the effort schema.
-    if NATIVE_REASONING_ENABLED and thinking_config.enabled and thinking_config.effort_level:
-        effort_fields = build_native_effort_fields(model_id, thinking_config.effort_level)
-        if effort_fields:
-            payload["additionalModelRequestFields"] = effort_fields
+    # (NOT prompt injection). The effort level is the client-supplied value, or
+    # DEFAULT_EFFORT_LEVEL when the client didn't specify one. Only emitted when
+    # native reasoning is enabled, thinking is on, and the model supports effort.
+    if NATIVE_REASONING_ENABLED and thinking_config.enabled:
+        effort_level = thinking_config.effort_level or DEFAULT_EFFORT_LEVEL
+        if effort_level:
+            effort_fields = build_native_effort_fields(model_id, effort_level)
+            if effort_fields:
+                payload["additionalModelRequestFields"] = effort_fields
 
     # Payload size guard — auto-trim if enabled
     if AUTO_TRIM_PAYLOAD:

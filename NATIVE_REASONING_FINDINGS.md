@@ -140,6 +140,14 @@ reject `additionalModelRequestFields` outright.
   reasoning (it previously polluted the system prompt with `<thinking_mode>`
   documentation on every request — the second injection path).
 
+### Global default effort (DEFAULT_EFFORT_LEVEL)
+
+`DEFAULT_EFFORT_LEVEL` (env, default unset) applies an effort level to every
+request that does NOT specify `reasoning_effort`. Set `DEFAULT_EFFORT_LEVEL=max`
+to force maximum native reasoning on all supported models by default; an
+explicit per-request `reasoning_effort` still overrides it. Models that don't
+support effort (see schema table) are skipped safely. Currently set to `max`.
+
 ## Repro scripts (kept in repo root, not packaged)
 - `probe_decode.py` — decode raw event-stream, show native reasoning vs answer.
 - `probe_native_reasoning.py` — probe whether native control fields are honored.
