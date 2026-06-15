@@ -1291,7 +1291,66 @@ class TestStreamWithFirstTokenRetryCore:
         assert len(chunks) == 3
         assert chunks == ["chunk1", "chunk2", "chunk3"]
         print("✓ Chunks yielded on success")
-    
+
+    @pytest.mark.asyncio
+    async def test_cancels_request_task_on_client_disconnect_during_prefill(self):
+        """
+        Regression: client disconnects during the prefill keepalive window.
+
+        When the upstream request is still pending and the client disconnects,
+        GeneratorExit is injected at the keepalive `yield`. The in-flight
+        request task (created via asyncio.create_task and shielded from the
+        per-chunk wait_for timeout) must be cancelled and drained here. If it
+        is left as an orphan, the caller's `finally: await http_client.close()`
+        closes the per-request client out from under it, and the orphan later
+        calls client.send() -> RuntimeError("Cannot send a request, as the
+        client has been closed.") surfacing as "Task exception was never
+        retrieved".
+        """
+        print("Setup: slow upstream request that stays pending...")
+        request_started = asyncio.Event()
+        release = asyncio.Event()  # never set during the test -> request hangs
+        captured = {}
+
+        async def slow_make_request():
+            # current task here IS the create_task'd req_task (it runs
+            # _run_make_request -> await make_request())
+            captured["task"] = asyncio.current_task()
+            request_started.set()
+            await release.wait()
+            resp = AsyncMock()
+            resp.status_code = 200
+            resp.aclose = AsyncMock()
+            return resp
+
+        async def proc(response):
+            yield "should-not-reach"
+
+        # Speed up only the hardcoded 3.0s keepalive wait so the test is fast.
+        _real_wait_for = asyncio.wait_for
+
+        async def _fast_wait_for(aw, timeout):
+            return await _real_wait_for(aw, timeout=0.05 if timeout == 3.0 else timeout)
+
+        print("Action: advance to keepalive yield, then disconnect...")
+        with patch("kiro.streaming_core.asyncio.wait_for", _fast_wait_for):
+            agen = stream_with_first_token_retry(
+                make_request=slow_make_request,
+                stream_processor=proc,
+                initial_response=None,
+            )
+            first = await agen.__anext__()
+            assert first == ": keepalive\n\n"
+            await request_started.wait()
+            # Simulate client disconnect -> GeneratorExit at the keepalive yield
+            await agen.aclose()
+
+        req_task = captured["task"]
+        print(f"req_task.done()={req_task.done()} cancelled()={req_task.cancelled()}")
+        assert req_task.done(), "orphan request task left pending after disconnect"
+        assert req_task.cancelled(), "request task should have been cancelled"
+        print("✓ Request task cancelled on client disconnect (no orphan)")
+
     @pytest.mark.asyncio
     async def test_retries_on_first_token_timeout(self):
         """

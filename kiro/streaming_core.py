@@ -477,17 +477,39 @@ async def stream_with_first_token_retry(
 
                 req_task = asyncio.create_task(_run_make_request())
                 _ka_count = 0
-                while not req_task.done():
-                    try:
-                        await asyncio.wait_for(asyncio.shield(req_task), timeout=3.0)
-                    except asyncio.TimeoutError:
-                        # SSE comment as keep-alive (ignored by OpenAI/Anthropic parsers)
-                        _ka_count += 1
-                        yield ": keepalive\n\n"
-                if _ka_count:
-                    logger.debug(f"Sent {_ka_count} keep-alive chunk(s) during prefill ({_ka_count * 3}s+ TTFT)")
-                response = req_task.result()
-            
+                try:
+                    while not req_task.done():
+                        try:
+                            await asyncio.wait_for(asyncio.shield(req_task), timeout=3.0)
+                        except asyncio.TimeoutError:
+                            # SSE comment as keep-alive (ignored by OpenAI/Anthropic parsers)
+                            _ka_count += 1
+                            yield ": keepalive\n\n"
+                    if _ka_count:
+                        logger.debug(f"Sent {_ka_count} keep-alive chunk(s) during prefill ({_ka_count * 3}s+ TTFT)")
+                    response = req_task.result()
+                finally:
+                    # If this generator is torn down before the request task
+                    # finishes - e.g. the client disconnects during the prefill
+                    # keepalive window, injecting GeneratorExit at the yield above
+                    # - the shielded task would otherwise survive as an orphan.
+                    # The caller's `finally: await http_client.close()` then closes
+                    # the per-request client, and the orphan task subsequently
+                    # calls client.send() on it, raising "Cannot send a request,
+                    # as the client has been closed." with no one to retrieve it
+                    # ("Task exception was never retrieved"). Cancel and drain the
+                    # task here so it dies before the client is closed.
+                    if not req_task.done():
+                        req_task.cancel()
+                        try:
+                            await req_task
+                        except BaseException:
+                            pass
+
+            # response is guaranteed assigned here: either from initial_response
+            # (attempt 0) or req_task.result() above. If the request raised, the
+            # exception propagated out of the try and we never reach this point.
+            assert response is not None
             if response.status_code != 200:
                 # Error from API - close response and raise exception
                 try:
