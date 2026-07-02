@@ -48,7 +48,7 @@ from kiro.streaming_core import (
     stream_with_first_token_retry,
 )
 from kiro.tokenizer import count_tokens, estimate_request_tokens
-from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls, StreamingXmlToolGate
 from kiro.config import FIRST_TOKEN_TIMEOUT, FIRST_TOKEN_MAX_RETRIES, FAKE_REASONING_HANDLING
 
 if TYPE_CHECKING:
@@ -165,6 +165,7 @@ async def stream_kiro_to_anthropic(
     output_tokens = 0
     full_content = ""
     full_thinking_content = ""
+    xml_gate = StreamingXmlToolGate()  # withholds Anthropic XML tool-call blocks from streamed content
     
     # NOTE: Anthropic streaming spec requires input_tokens in message_start (beginning),
     # but Kiro API provides accurate context_usage at the end of stream.
@@ -224,7 +225,13 @@ async def stream_kiro_to_anthropic(
             if event.type == "content":
                 content = event.content or ""
                 full_content += content
-                
+
+                # Route content through the XML gate so Anthropic
+                # <function_calls>/<invoke> tool-call XML never streams as text.
+                safe_content = xml_gate.feed(content)
+                if not safe_content:
+                    continue
+
                 # Close thinking block if it was open and we're now getting regular content
                 if thinking_block_started and thinking_block_index is not None:
                     yield format_sse_event("content_block_stop", {
@@ -248,15 +255,14 @@ async def stream_kiro_to_anthropic(
                     text_block_started = True
                 
                 # Send content delta
-                if content:
-                    yield format_sse_event("content_block_delta", {
-                        "type": "content_block_delta",
-                        "index": text_block_index,
-                        "delta": {
-                            "type": "text_delta",
-                            "text": content
-                        }
-                    })
+                yield format_sse_event("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": text_block_index,
+                    "delta": {
+                        "type": "text_delta",
+                        "text": safe_content
+                    }
+                })
             
             elif event.type == "thinking":
                 thinking_content = event.thinking_content or ""
@@ -522,12 +528,31 @@ async def stream_kiro_to_anthropic(
                 context_usage_percentage = event.context_usage_percentage
             elif event.type == "usage" and event.usage:
                 upstream_cache_usage.update(_extract_cache_usage_fields(event.usage))
-        
+
+        # Flush the XML gate: recover withheld Anthropic XML tool calls and emit
+        # any safe (non-XML) text that remained buffered into the text block.
+        xml_leftover, xml_tool_calls = xml_gate.flush()
+        if xml_leftover:
+            if not text_block_started:
+                text_block_index = current_block_index
+                yield format_sse_event("content_block_start", {
+                    "type": "content_block_start",
+                    "index": text_block_index,
+                    "content_block": {"type": "text", "text": ""}
+                })
+                text_block_started = True
+            yield format_sse_event("content_block_delta", {
+                "type": "content_block_delta",
+                "index": text_block_index,
+                "delta": {"type": "text_delta", "text": xml_leftover}
+            })
+
         # Track completion signals for truncation detection
         stream_completed_normally = context_usage_percentage is not None
         
-        # Check for bracket-style tool calls in full content
-        bracket_tool_calls = parse_bracket_tool_calls(full_content)
+        # Check for bracket-style tool calls in full content, plus any XML
+        # tool calls recovered from the gate. Both are emitted as tool_use blocks.
+        bracket_tool_calls = parse_bracket_tool_calls(full_content) + xml_tool_calls
         if bracket_tool_calls:
             # Close thinking block if open
             if thinking_block_started and thinking_block_index is not None:

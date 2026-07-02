@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING, Any, AsyncGenerator, Callable, Awaitable, Dict
 import httpx
 from loguru import logger
 
-from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.parsers import AwsEventStreamParser, parse_bracket_tool_calls, deduplicate_tool_calls, parse_xml_tool_calls, strip_xml_tool_calls
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
     FIRST_TOKEN_MAX_RETRIES,
@@ -361,7 +361,14 @@ async def collect_stream_to_result(
     bracket_tool_calls = parse_bracket_tool_calls(full_content_for_bracket_tools)
     if bracket_tool_calls:
         result.tool_calls = deduplicate_tool_calls(result.tool_calls + bracket_tool_calls)
-    
+
+    # Recover Anthropic XML tool calls that leaked into the text channel and
+    # strip the raw XML from the visible content so it doesn't render as text.
+    xml_tool_calls = parse_xml_tool_calls(result.content)
+    if xml_tool_calls:
+        result.tool_calls = deduplicate_tool_calls(result.tool_calls + xml_tool_calls)
+        result.content = strip_xml_tool_calls(result.content)
+
     return result
 
 

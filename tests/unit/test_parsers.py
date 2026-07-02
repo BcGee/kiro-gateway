@@ -5,13 +5,18 @@ Unit tests for AwsEventStreamParser and auxiliary parsing functions.
 Tests the parsing logic for AWS SSE stream from Kiro API.
 """
 
+import json
+
 import pytest
 
 from kiro.parsers import (
     AwsEventStreamParser,
     find_matching_brace,
     parse_bracket_tool_calls,
-    deduplicate_tool_calls
+    deduplicate_tool_calls,
+    parse_xml_tool_calls,
+    strip_xml_tool_calls,
+    StreamingXmlToolGate,
 )
 
 
@@ -385,6 +390,139 @@ class TestDeduplicateToolCalls:
         # Verify that call_1 kept its arguments
         call_1 = next(tc for tc in result if tc["id"] == "call_1")
         assert call_1["function"]["arguments"] == '{"x": 1}'
+
+
+class TestParseXmlToolCalls:
+    """Tests for parse_xml_tool_calls (Anthropic <invoke> XML format)."""
+
+    def test_single_invoke_with_params(self):
+        text = (
+            '<function_calls><invoke name="read_file">'
+            '<parameter name="path">/tmp/x</parameter>'
+            '<parameter name="limit">50</parameter>'
+            '</invoke></function_calls>'
+        )
+        calls = parse_xml_tool_calls(text)
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "read_file"
+        assert calls[0]["type"] == "function"
+        args = json.loads(calls[0]["function"]["arguments"])
+        assert args == {"path": "/tmp/x", "limit": 50}
+
+    def test_invoke_without_wrapper(self):
+        # Bare <invoke> without <function_calls> wrapper still parses.
+        text = '<invoke name="ping"><parameter name="host">a.com</parameter></invoke>'
+        calls = parse_xml_tool_calls(text)
+        assert len(calls) == 1 and calls[0]["function"]["name"] == "ping"
+
+    def test_multiple_invokes(self):
+        text = (
+            '<invoke name="a"><parameter name="x">1</parameter></invoke>'
+            '<invoke name="b"><parameter name="y">2</parameter></invoke>'
+        )
+        calls = parse_xml_tool_calls(text)
+        assert [c["function"]["name"] for c in calls] == ["a", "b"]
+
+    def test_json_object_param(self):
+        text = (
+            '<invoke name="cfg"><parameter name="opts">{"a": 1, "b": [2, 3]}</parameter></invoke>'
+        )
+        calls = parse_xml_tool_calls(text)
+        args = json.loads(calls[0]["function"]["arguments"])
+        assert args["opts"] == {"a": 1, "b": [2, 3]}
+
+    def test_string_param_not_json(self):
+        text = '<invoke name="say"><parameter name="msg">hello world</parameter></invoke>'
+        calls = parse_xml_tool_calls(text)
+        args = json.loads(calls[0]["function"]["arguments"])
+        assert args["msg"] == "hello world"
+
+    def test_bool_and_null_params(self):
+        text = (
+            '<invoke name="f">'
+            '<parameter name="flag">true</parameter>'
+            '<parameter name="empty">null</parameter>'
+            '</invoke>'
+        )
+        args = json.loads(parse_xml_tool_calls(text)[0]["function"]["arguments"])
+        assert args["flag"] is True
+        assert args["empty"] is None
+
+    def test_empty_and_none_input(self):
+        assert parse_xml_tool_calls("") == []
+        assert parse_xml_tool_calls(None) == []
+        assert parse_xml_tool_calls("just prose, no tools") == []
+
+    def test_prose_around_invoke(self):
+        text = 'Let me read that.\n<invoke name="read"><parameter name="p">/a</parameter></invoke>\nDone.'
+        calls = parse_xml_tool_calls(text)
+        assert len(calls) == 1 and calls[0]["function"]["name"] == "read"
+
+
+class TestStripXmlToolCalls:
+    """Tests for strip_xml_tool_calls."""
+
+    def test_strip_wrapped(self):
+        text = 'before <function_calls><invoke name="x"><parameter name="a">1</parameter></invoke></function_calls> after'
+        assert strip_xml_tool_calls(text) == "before  after".strip()
+
+    def test_strip_bare_invoke(self):
+        text = 'prose <invoke name="x"><parameter name="a">1</parameter></invoke>'
+        assert strip_xml_tool_calls(text) == "prose"
+
+    def test_no_xml_unchanged(self):
+        assert strip_xml_tool_calls("plain text") == "plain text"
+        assert strip_xml_tool_calls("") == ""
+
+
+class TestStreamingXmlToolGate:
+    """Tests for the incremental StreamingXmlToolGate."""
+
+    XML = (
+        '<function_calls><invoke name="read_file">'
+        '<parameter name="path">/tmp/x</parameter>'
+        '</invoke></function_calls>'
+    )
+
+    def _feed_all(self, gate, text, chunk_size=1):
+        emitted = ""
+        for i in range(0, len(text), chunk_size):
+            emitted += gate.feed(text[i:i + chunk_size])
+        leftover, calls = gate.flush()
+        return emitted + leftover, calls
+
+    def test_char_by_char_no_leak(self):
+        gate = StreamingXmlToolGate()
+        emitted, calls = self._feed_all(gate, self.XML, chunk_size=1)
+        assert emitted == ""  # no XML leaked to content
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "read_file"
+
+    def test_prose_prefix_preserved(self):
+        gate = StreamingXmlToolGate()
+        emitted, calls = self._feed_all(gate, "Reading now." + self.XML, chunk_size=3)
+        assert emitted == "Reading now."
+        assert len(calls) == 1
+
+    def test_plain_prose_with_angle_brackets(self):
+        # Lone < and > in prose must NOT be withheld.
+        gate = StreamingXmlToolGate()
+        text = "if a < b and c > d then done"
+        emitted, calls = self._feed_all(gate, text, chunk_size=1)
+        assert emitted == text
+        assert calls == []
+
+    def test_whole_chunk_at_once(self):
+        gate = StreamingXmlToolGate()
+        emitted, calls = self._feed_all(gate, "prefix " + self.XML, chunk_size=len(self.XML) + 7)
+        assert emitted == "prefix "
+        assert len(calls) == 1
+
+    def test_no_xml_passthrough(self):
+        gate = StreamingXmlToolGate()
+        emitted, calls = self._feed_all(gate, "hello world no tools here", chunk_size=4)
+        assert emitted == "hello world no tools here"
+        assert calls == []
 
 
 class TestAwsEventStreamParserInitialization:

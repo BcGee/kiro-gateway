@@ -37,7 +37,7 @@ import httpx
 from fastapi import HTTPException
 from loguru import logger
 
-from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls
+from kiro.parsers import parse_bracket_tool_calls, deduplicate_tool_calls, StreamingXmlToolGate
 from kiro.utils import generate_completion_id
 from kiro.config import (
     FIRST_TOKEN_TIMEOUT,
@@ -132,6 +132,7 @@ async def stream_kiro_to_openai_internal(
     
     streaming_error_occurred = False
     tool_calls_from_stream = []
+    xml_gate = StreamingXmlToolGate()  # withholds Anthropic XML tool-call blocks from streamed content
     
     try:
         # Use streaming_core.parse_kiro_stream for unified event parsing
@@ -140,9 +141,17 @@ async def stream_kiro_to_openai_internal(
             if event.type == "content" and event.content:
                 # Accumulate content for bracket tool call detection
                 full_content += event.content
-                
+
+                # Route through the XML gate: it withholds any Anthropic
+                # <function_calls>/<invoke> tool-call XML so it never streams to
+                # the client as text. Only the safe portion is emitted here;
+                # recovered tool calls are merged at end-of-stream via flush().
+                safe_content = xml_gate.feed(event.content)
+                if not safe_content:
+                    continue
+
                 # Format as OpenAI chunk
-                delta = {"content": event.content}
+                delta = {"content": safe_content}
                 if first_chunk:
                     delta["role"] = "assistant"
                     first_chunk = False
@@ -379,7 +388,24 @@ async def stream_kiro_to_openai_internal(
             
             elif event.type == "context_usage" and event.context_usage_percentage is not None:
                 context_usage_percentage = event.context_usage_percentage
-        
+
+        # Flush the XML gate: recover any withheld Anthropic XML tool calls and
+        # emit whatever safe (non-XML) text remained buffered.
+        xml_leftover, xml_tool_calls = xml_gate.flush()
+        if xml_leftover:
+            delta = {"content": xml_leftover}
+            if first_chunk:
+                delta["role"] = "assistant"
+                first_chunk = False
+            leftover_chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created_time,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+            }
+            yield f"data: {json.dumps(leftover_chunk, ensure_ascii=False)}\n\n"
+
         # Track completion signals for truncation detection
         received_usage = metering_data is not None
         received_context_usage = context_usage_percentage is not None
@@ -387,7 +413,7 @@ async def stream_kiro_to_openai_internal(
         
         # Check bracket-style tool calls in full content
         bracket_tool_calls = parse_bracket_tool_calls(full_content)
-        all_tool_calls = tool_calls_from_stream + bracket_tool_calls
+        all_tool_calls = tool_calls_from_stream + bracket_tool_calls + xml_tool_calls
         all_tool_calls = deduplicate_tool_calls(all_tool_calls)
         
         # Detect content truncation (missing completion signals)
